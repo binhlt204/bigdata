@@ -535,7 +535,7 @@ class MultiheadAttention(Module):
 
 
 # for graph construction
-import nmslib
+import faiss
 import math
 class Hnsw:
     def __init__(self, space='cosinesimil', index_params=None,
@@ -557,7 +557,7 @@ class Hnsw:
         # this is the actual nmslib part, hopefully the syntax should
         # be pretty readable, the documentation also has a more verbiage
         # introduction: https://nmslib.github.io/nmslib/quickstart.html
-        index = nmslib.init(space=self.space, method='hnsw')
+        index = faiss.init(space=self.space, method='hnsw')
         index.addDataPointBatch(X)
         index.createIndex(index_params)
         index.setQueryTimeParams(query_params)

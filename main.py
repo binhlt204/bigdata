@@ -1,10 +1,13 @@
 from __future__ import print_function
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import argparse
 import os
 from utils.file_utils import save_pkl
 from utils.utils import *
 from utils.core_utils import train
-from datasets.dataset_generic import Generic_MIL_Dataset
+from wsi_datasets.dataset_generic import Generic_MIL_Dataset
 import torch
 import pandas as pd
 import numpy as np
@@ -42,6 +45,17 @@ parser.add_argument("--text_prompt_path", type=str, default=None)
 parser.add_argument("--prototype_number", type=int, default=16)
 parser.add_argument("--window_size", type=int, default=8)
 parser.add_argument("--sim_threshold", type=float, default=0.8)
+
+parser.add_argument("--use_prompt", action="store_true", default=False,
+                    help="Enable text prompt learning")
+parser.add_argument("--use_KAVTC", action="store_true", default=False,
+                    help="Enable KAVTC token selection")
+parser.add_argument("--use_SVTC", action="store_true", default=False,
+                    help="Enable SVTC token compression")
+parser.add_argument("--use_CrossAgg", action="store_true", default=False,
+                    help="Enable CrossAgg cross-attention")
+
+
 
 args = parser.parse_args()
 args.text_prompt = np.array(pd.read_csv(args.text_prompt_path, header=None)).squeeze()

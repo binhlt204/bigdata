@@ -6,8 +6,61 @@ import pandas as pd
 from scipy import stats
 from torch.utils.data import Dataset
 import h5py
+import math
+from itertools import islice
+import collections
+# from utils.utils import generate_split, nth
 
-from utils.utils import generate_split, nth
+import argparse, os, glob, torch
+from torchvision import models, transforms
+from PIL import Image
+from tqdm import tqdm
+
+def generate_split(cls_ids, val_num, test_num, samples, n_splits = 5,
+	seed = 7, label_frac = 1.0, custom_test_ids = None):
+	indices = np.arange(samples).astype(int)
+	
+	if custom_test_ids is not None:
+		indices = np.setdiff1d(indices, custom_test_ids)
+
+	np.random.seed(seed)
+	for i in range(n_splits):
+		all_val_ids = []
+		all_test_ids = []
+		sampled_train_ids = []
+		
+		if custom_test_ids is not None: # pre-built test split, do not need to sample
+			all_test_ids.extend(custom_test_ids)
+
+		for c in range(len(val_num)):
+			possible_indices = np.intersect1d(cls_ids[c], indices) #all indices of this class
+			val_ids = np.random.choice(possible_indices, val_num[c], replace = False) # validation ids
+
+			remaining_ids = np.setdiff1d(possible_indices, val_ids) #indices of this class left after validation
+			all_val_ids.extend(val_ids)
+
+			if custom_test_ids is None:  # sample test split
+				test_ids = np.random.choice(remaining_ids, test_num[c], replace = False)
+				remaining_ids = np.setdiff1d(remaining_ids, test_ids)
+				all_test_ids.extend(test_ids)
+			# all_test_ids.extend(val_ids)
+
+			if label_frac == 1:
+				sampled_train_ids.extend(remaining_ids)
+			
+			else:
+				sample_num = math.ceil(len(remaining_ids) * label_frac)
+				slice_ids = np.arange(sample_num)
+				sampled_train_ids.extend(remaining_ids[slice_ids])
+
+		yield sampled_train_ids, all_val_ids, all_test_ids
+
+
+def nth(iterator, n, default=None):
+	if n is None:
+		return collections.deque(iterator, maxlen=0)
+	else:
+		return next(islice(iterator,n, None), default)
 
 def save_splits(split_datasets, column_keys, filename, boolean_style=False):
 	splits = [split_datasets[i].slide_data['slide_id'] for i in range(len(split_datasets))]
@@ -390,3 +443,45 @@ class Generic_Split(Generic_MIL_Dataset):
 
 	def __len__(self):
 		return len(self.slide_data)
+
+# if __name__ == "__main__":
+    
+
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument('--source', type=str, required=True,
+#                         help="Thư mục chứa ảnh gốc (.png)")
+#     parser.add_argument('--target', type=str, required=True,
+#                         help="Thư mục để lưu .pt features")
+#     parser.add_argument('--batch_size', type=int, default=64)
+#     parser.add_argument('--model', type=str, default='resnet50')
+#     args = parser.parse_args()
+
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+#     # chọn backbone
+#     if args.model == "resnet50":
+#         backbone = models.resnet50(weights="IMAGENET1K_V1")
+#     else:
+#         raise ValueError("Chỉ hỗ trợ resnet50 ở đây")
+#     backbone.fc = torch.nn.Identity()  # bỏ classifier
+#     backbone = backbone.to(device).eval()
+
+#     transform = transforms.Compose([
+#         transforms.Resize((224,224)),
+#         transforms.ToTensor(),
+#         transforms.Normalize(mean=[0.485,0.456,0.406],
+#                              std=[0.229,0.224,0.225])
+#     ])
+
+#     os.makedirs(args.target, exist_ok=True)
+
+#     image_files = glob.glob(os.path.join(args.source, "*.png"))
+#     print(f"Found {len(image_files)} images")
+
+#     for img_path in tqdm(image_files):
+#         slide_id = os.path.splitext(os.path.basename(img_path))[0]
+#         img = Image.open(img_path).convert("RGB")
+#         x = transform(img).unsqueeze(0).to(device)
+#         with torch.no_grad():
+#             feat = backbone(x).cpu()
+#         torch.save(feat, os.path.join(args.target, f"{slide_id}.pt"))

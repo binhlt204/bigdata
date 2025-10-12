@@ -13,6 +13,7 @@ import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
 
+
 from conch.open_clip_custom import create_model_from_pretrained, get_tokenizer, tokenize
 
 class TextEncoder(nn.Module):
@@ -170,6 +171,9 @@ def _no_grad_trunc_normal_(tensor, mean, std, a, b):
 def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
+
+
+
 class FOCUS(nn.Module):
     def __init__(self, config, num_classes=3):
         super(FOCUS, self).__init__()
@@ -177,211 +181,256 @@ class FOCUS(nn.Module):
         self.num_classes = num_classes
         self.window_size = config.window_size
         self.sim_threshold = config.sim_threshold
-        
-        # Feature dimensions
-        self.L = config.input_size
-        # self.D = config.input_size
+
+        # Flags từ config
+        self.use_prompt = getattr(config, "use_prompt", False)
+        self.use_KAVTC = getattr(config, "use_KAVTC", False)
+        self.use_SVTC = getattr(config, "use_SVTC", False)
+        self.use_CrossAgg = getattr(config, "use_CrossAgg", False)
+
+        self.L = 768
         self.D = 512
         self.L_max = config.max_context_length
-        
-        conch_model_cfg = 'conch_ViT-B-16'
-        conch_checkpoint_path = 'ckpts/conch.pth'
-        conch_model, preprocess = create_model_from_pretrained(conch_model_cfg, conch_checkpoint_path)
-        _ = conch_model.eval()
-        
-        self.feature_dim = conch_model.text.text_projection.shape[1] # 512
-        
-        self.prompt_learner = PromptLearner(config.text_prompt, conch_model.float())
-        self.text_encoder = TextEncoder(conch_model.float())
-        
-        # Feature encoder with projection
+
+        # Feature encoder base - ALWAYS needed
         self.feature_encoder = nn.Sequential(
-            nn.Linear(self.L, self.D), # 512 -> 512
+            nn.Linear(self.L, self.D),
             nn.LayerNorm(self.D),
             nn.ReLU(),
             nn.Dropout(0.25)
         )
-        
-        # Cross attention components
-        num_heads = 8
-        self.head_dim = self.feature_dim // num_heads
-        self.q_proj = nn.Linear(self.feature_dim, self.feature_dim)
-        self.k_proj = nn.Linear(self.feature_dim, self.feature_dim)
-        self.v_proj = nn.Linear(self.feature_dim, self.feature_dim)
-        self.o_proj = nn.Linear(self.feature_dim, self.feature_dim)
-        self.num_heads = num_heads
+
+        # Initialize text components if any text-related module is used
+        if self.use_prompt or self.use_KAVTC or self.use_SVTC or self.use_CrossAgg:
+            conch_model_cfg = 'conch_ViT-B-16'
+            conch_checkpoint_path = 'ckpts/conch.pth'
+            conch_model, _ = create_model_from_pretrained(conch_model_cfg, conch_checkpoint_path)
+            _ = conch_model.eval()
+
+            # Use text projection dimension for consistency
+            self.text_dim = conch_model.text.text_projection.shape[1]  # 512
+            self.prompt_learner = PromptLearner(config.text_prompt, conch_model.float())
+            self.text_encoder = TextEncoder(conch_model.float())
+            
+            # Project visual features to match text dimension
+            self.feature_projector = nn.Linear(self.D, self.text_dim)
+            self.classifier_dim = self.text_dim
+        else:
+            self.text_dim = None
+            self.feature_projector = None
+            self.classifier_dim = self.D
+
+        # Cross-attention components
+        if self.use_CrossAgg:
+            num_heads = 8
+            self.head_dim = self.text_dim // num_heads
+            self.cross_attention = nn.MultiheadAttention(
+                embed_dim=self.text_dim,
+                num_heads=num_heads,
+                batch_first=True
+            )
+
+        # MIL aggregation
+        self.attention_weights = nn.Linear(self.classifier_dim, 1)
         
         # Classifier
-        self.classifier = nn.Linear(self.feature_dim, num_classes)
-        
-    def cross_attention(self, queries, keys, values, attention_mask=None):
-        bsz, q_len, _ = queries.size()
-        _, kv_len, _ = keys.size()
-        
-        # Linear projections
-        query_states = self.q_proj(queries)
-        key_states = self.k_proj(keys)
-        value_states = self.v_proj(values)
-        
-        # Reshape for multi-head attention
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, kv_len, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Scaled dot-product attention
-        attn_output = F.scaled_dot_product_attention(
-            query_states, key_states, value_states,
-            attn_mask=attention_mask
-        )
-        
-        # Reshape and project output
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.feature_dim)
-        attn_output = self.o_proj(attn_output)
-        
-        return attn_output
+        self.classifier = nn.Linear(self.classifier_dim, num_classes)
 
-    def compute_patch_similarity(self, x, window_size):
-        """Compute similarity between patches within sliding windows"""
-        N, D = x.shape
-        x_norm = F.normalize(x, p=2, dim=-1)
+    def adaptive_token_selection(self, features, text_features, debug=False):
+        """
+        KAVTC: Knowledge-enhanced Adaptive Visual Token Compression
+        """
+        batch_size, n_tokens, feature_dim = features.shape
         
-        similarities = []
-        selected_indices = []
+        if debug:
+            print(f"KAVTC input: {features.shape}")
         
-        for i in range(0, N, window_size):
-            window = x_norm[i:i+window_size]
+        # Compute relevance scores using text guidance
+        # features: [B, N, D], text_features: [C, D] 
+        text_mean = text_features.mean(dim=0, keepdim=True)  # [1, D]
+        text_mean = text_mean.unsqueeze(0).expand(batch_size, -1, -1)  # [B, 1, D]
+        
+        # Compute similarity between each token and text
+        features_norm = F.normalize(features, dim=-1)  # [B, N, D]
+        text_norm = F.normalize(text_mean, dim=-1)  # [B, 1, D]
+        
+        # Similarity scores: [B, N]
+        similarity = torch.bmm(features_norm, text_norm.transpose(-1, -2)).squeeze(-1)
+        
+        # Adaptive selection: keep top-k tokens per sample
+        keep_ratio = 0.7  # Keep 70% of tokens
+        num_keep = max(1, int(n_tokens * keep_ratio))
+        
+        # Select top tokens for each sample
+        _, top_indices = torch.topk(similarity, num_keep, dim=1)
+        top_indices, _ = torch.sort(top_indices, dim=1)  # Maintain order
+        
+        # Gather selected tokens
+        batch_indices = torch.arange(batch_size).unsqueeze(1).expand(-1, num_keep)
+        selected_features = features[batch_indices, top_indices]  # [B, num_keep, D]
+        
+        if debug:
+            print(f"KAVTC output: {selected_features.shape} (kept {num_keep}/{n_tokens} tokens)")
+        
+        return selected_features
+
+    def spatial_token_compression(self, features, text_features=None, debug=False):
+        """
+        SVTC: Sequential Visual Token Compression
+        """
+        batch_size, n_tokens, feature_dim = features.shape
+        
+        if debug:
+            print(f"SVTC input: {features.shape}")
+        
+        compressed_features = []
+        
+        for b in range(batch_size):
+            tokens = features[b]  # [N, D]
             
-            # Skip if window is too small
-            if len(window) < 2:
-                selected_indices.append(torch.arange(i, min(i+window_size, N), device=x.device))
+            if n_tokens <= 2:
+                compressed_features.append(tokens)
                 continue
-                
-            # Local similarity computation
-            window_sim = torch.mm(window, window.t())
             
-            # Adaptive thresholding
-            # Only compute std if we have enough samples
-            if window_sim.numel() > 1:
-                threshold = window_sim.mean() + window_sim.std(unbiased=False)  # use biased std
-            else:
-                threshold = window_sim.mean()  # fallback to just mean if not enough samples
+            # Compute pairwise similarities
+            tokens_norm = F.normalize(tokens, dim=-1)
+            sim_matrix = torch.mm(tokens_norm, tokens_norm.T)  # [N, N]
             
-            # Select non-redundant patches
-            redundant = window_sim.mean(1) > threshold
-            keep_indices = torch.where(~redundant)[0] + i
+            # Remove self-similarity
+            sim_matrix.fill_diagonal_(0)
             
-            # If all patches are marked as redundant, keep at least one
-            if len(keep_indices) == 0:
-                keep_indices = torch.tensor([i], device=x.device)
-                
-            selected_indices.append(keep_indices)
-            similarities.append(window_sim)
+            # Find redundant tokens
+            avg_sim = sim_matrix.mean(dim=1)  # Average similarity to other tokens
+            threshold = avg_sim.mean() + 0.5 * avg_sim.std()
+            
+            # Keep tokens with low average similarity (more unique)
+            keep_mask = avg_sim < threshold
+            
+            # Ensure we keep at least 30% of tokens
+            min_keep = max(1, int(0.3 * n_tokens))
+            if keep_mask.sum() < min_keep:
+                _, indices = torch.topk(-avg_sim, min_keep)  # Keep least similar
+                keep_mask = torch.zeros_like(keep_mask, dtype=torch.bool)
+                keep_mask[indices] = True
+            
+            compressed_tokens = tokens[keep_mask]
+            compressed_features.append(compressed_tokens)
         
-        # Handle case where no indices were selected
-        if not selected_indices:
-            return [], torch.arange(N, device=x.device)
-            
-        return similarities, torch.cat(selected_indices)
+        # Pad to same length
+        max_len = max(feat.shape[0] for feat in compressed_features)
+        padded_features = []
+        
+        for feat in compressed_features:
+            if feat.shape[0] < max_len:
+                padding = torch.zeros(max_len - feat.shape[0], feature_dim, 
+                                    device=feat.device, dtype=feat.dtype)
+                feat = torch.cat([feat, padding], dim=0)
+            padded_features.append(feat)
+        
+        result = torch.stack(padded_features, dim=0)
+        
+        if debug:
+            print(f"SVTC output: {result.shape}")
+        
+        return result
 
-    def adaptive_token_selection(self, features, text_features):
-        """Select tokens based on text relevance and local structure"""
-        N, D = features.shape
+    def forward(self, x_s, x_l, label, debug=False):
+        """
+        Fixed forward pass with proper feature flow
+        """
+        # Encode visual features
+        features = self.feature_encoder(x_l.float())  # [N, D=512]
         
-        # Compute similarities and get initial selection
-        similarities, indices = self.compute_patch_similarity(features, self.window_size)
+        if debug:
+            print(f"Encoded features: {features.shape}")
         
-        # Project features to match text_features dimension if needed
-        if features.shape[-1] != text_features.shape[-1]:
-            projection = nn.Linear(features.shape[-1], text_features.shape[-1], device=features.device)
-            features_projected = projection(features)
-        else:
-            features_projected = features
+        # Add batch dimension for single sample
+        if features.dim() == 2:
+            features = features.unsqueeze(0)  # [1, N, D]
         
-        # Text-guided importance scoring
-        text_relevance = torch.matmul(features_projected, text_features.T).mean(-1)
-        
-        # Create importance mask
-        importance_mask = torch.zeros(N, device=features.device)
-        importance_mask[indices] = text_relevance[indices]
-        
-        # Select top tokens
-        num_tokens = min(self.L_max, N)
-        _, selected_indices = torch.topk(importance_mask, num_tokens)
-        selected_indices, _ = torch.sort(selected_indices)  # maintain sequence order
-        
-        selected_features = features[selected_indices]
-        
-        return selected_features, selected_indices
+        # Get text features if needed
+        text_features = None
+        if self.use_prompt or self.use_KAVTC or self.use_SVTC or self.use_CrossAgg:
+            prompts = self.prompt_learner()  # [C, seq_len, dim]
+            # FIX: Don't slice the text features - use all class embeddings
+            text_features = self.text_encoder(prompts, self.prompt_learner.tokenized_prompts)  # [C, text_dim]
+            
+            # Project visual features to text dimension
+            features = self.feature_projector(features)  # [B, N, text_dim]
+            
+            if debug:
+                print(f"Text features: {text_features.shape}")
+                print(f"Projected features: {features.shape}")
 
-    def spatial_token_compression(self, features, text_features):
-        """Compress tokens while preserving important information"""
-        N, D = features.shape
-        
-        # Process in chunks like LongVU
-        chunk_size = 8  # Similar to LongVU's implementation
-        compressed_chunks = []
-        
-        for i in range(0, N, chunk_size):
-            chunk = features[i:i+chunk_size]
-            if len(chunk) == 1:
-                compressed_chunks.append(chunk)
-                continue
-                
-            # Compute chunk similarities
-            chunk_norm = F.normalize(chunk, p=2, dim=-1)
-            sim = F.cosine_similarity(
-                chunk_norm[:-1],
-                chunk_norm[1:],
-                dim=-1
+        # Apply KAVTC
+        if self.use_KAVTC and text_features is not None:
+            features = self.adaptive_token_selection(features, text_features, debug)
+
+        # Apply SVTC  
+        if self.use_SVTC:
+            features = self.spatial_token_compression(features, text_features, debug)
+
+        # Apply Cross-modal Attention
+        if self.use_CrossAgg and text_features is not None:
+            batch_size = features.shape[0]
+            
+            # Expand text features for each sample in batch
+            text_expanded = text_features.unsqueeze(0).expand(batch_size, -1, -1)  # [B, C, D]
+            
+            # Cross attention: visual features attend to text features
+            attended_features, _ = self.cross_attention(
+                query=features,      # [B, N, D] - visual queries
+                key=text_expanded,   # [B, C, D] - text keys  
+                value=text_expanded  # [B, C, D] - text values
             )
             
-            # Keep first token and dissimilar tokens
-            keep_mask = sim < self.sim_threshold
-            kept_tokens = torch.cat([
-                chunk[:1],
-                chunk[1:][keep_mask]
-            ])
-            compressed_chunks.append(kept_tokens)
-        
-        compressed_features = torch.cat(compressed_chunks)
-        
-        # Ensure we don't exceed max length
-        if len(compressed_features) > self.L_max:
-            compressed_features = compressed_features[:self.L_max]
+            # Combine with original features
+            alpha = 0.5
+            features = alpha * features + (1 - alpha) * attended_features
             
-        return compressed_features
+            if debug:
+                print(f"Cross-attention output: {features.shape}")
 
-    def forward(self, x_s, x_l, label):
-        # Get text features
-        prompts = self.prompt_learner()
-        text_features = self.text_encoder(prompts, self.prompt_learner.tokenized_prompts)[self.num_classes:]
+        # MIL Aggregation with attention
+        attention_scores = self.attention_weights(features)  # [B, N, 1]
+        attention_weights = F.softmax(attention_scores, dim=1)  # [B, N, 1]
         
-        # Encode and project features
-        features = self.feature_encoder(x_l.float())
+        # Weighted aggregation
+        aggregated_features = torch.sum(attention_weights * features, dim=1)  # [B, D]
         
-        # Apply token selection and compression
-        selected_features, _ = self.adaptive_token_selection(features, text_features)
-        compressed_features = self.spatial_token_compression(selected_features, text_features)
-        
-        # Prepare for attention
-        compressed_features = compressed_features.unsqueeze(0)  # Add batch dimension
-        text_features = text_features.unsqueeze(0)
-        
-        # Cross attention
-        attended_features = self.cross_attention(
-            text_features,
-            compressed_features,
-            compressed_features
-        )
-        
+        if debug:
+            print(f"Aggregated features: {aggregated_features.shape}")
+
         # Classification
-        final_features = attended_features.mean(1)
-        logits = self.classifier(final_features)
+        logits = self.classifier(aggregated_features)  # [B, num_classes]
         
-        # Compute loss and predictions
+        # Handle single sample case
+        if logits.shape[0] == 1 and label.dim() == 0:
+            label = label.unsqueeze(0)
+        
         loss = self.loss_ce(logits, label)
         Y_prob = F.softmax(logits, dim=1)
         Y_hat = torch.topk(Y_prob, 1, dim=1)[1]
         
+        if debug:
+            print(f"Logits: {logits.shape}, Loss: {loss.item():.4f}")
+            print("=" * 50)
+        
         return Y_prob, Y_hat, loss
+
+    def get_attention_weights(self, x_s, x_l):
+        """
+        Get attention weights for visualization
+        """
+        with torch.no_grad():
+            features = self.feature_encoder(x_l.float())
+            if features.dim() == 2:
+                features = features.unsqueeze(0)
+                
+            if hasattr(self, 'feature_projector') and self.feature_projector is not None:
+                features = self.feature_projector(features)
+                
+            attention_scores = self.attention_weights(features)
+            attention_weights = F.softmax(attention_scores, dim=1)
+            
+        return attention_weights.squeeze(0).squeeze(-1)  # [N]
