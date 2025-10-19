@@ -12,6 +12,8 @@ import torch
 import pandas as pd
 import numpy as np
 
+from deepseek_module.deepseek_local import ensure_prompts_csv, load_two_scale_prompts, copy_prompt_to_results
+
 device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Generic training settings
@@ -58,7 +60,19 @@ parser.add_argument("--use_CrossAgg", action="store_true", default=False,
 
 
 args = parser.parse_args()
-args.text_prompt = np.array(pd.read_csv(args.text_prompt_path, header=None)).squeeze()
+
+# 🔹 Tạo hoặc nạp file prompt thực tế từ DeepSeek
+if args.text_prompt_path is None:
+    args.text_prompt_path = ensure_prompts_csv(model_name="deepseek-ai/deepseek-coder-1.3b-base")
+
+args.text_prompt = np.array(load_two_scale_prompts(args.text_prompt_path))
+print(f"✅ Loaded {len(args.text_prompt)} text prompts from {args.text_prompt_path}")
+
+# 🔹 Lưu bản sao prompt ra thư mục kết quả
+os.makedirs(args.results_dir, exist_ok=True)
+copy_prompt_to_results(args.text_prompt_path, args.results_dir)
+
+# args.text_prompt = np.array(pd.read_csv(args.text_prompt_path, header=None)).squeeze()
 
 def seed_torch(seed=7):
     import random
