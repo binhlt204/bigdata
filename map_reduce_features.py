@@ -39,9 +39,7 @@ def extract_with_model(x, ckpt_path):
 # ---------------- Main Pipeline ----------------
 def main(csv_path, source_folder, output_csv, features_dir, ckpt_path="ckpts/conch.pth"):
     # Spark config (tăng memory một chút)
-    conf = SparkConf().setAppName("FeatureMapReduce") \
-                      .set("spark.driver.memory", "6g") \
-                      .set("spark.executor.memory", "4g")
+    conf = SparkConf().setAppName("FeatureMapReduce") 
     sc = SparkContext(conf=conf)
 
     # Đọc metadata
